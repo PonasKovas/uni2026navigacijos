@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32l432kc", "time-driver-any", "unstable-pac"] }
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32l432kc", "time-driver-any", "unstable-pac", "exti"] }
 embassy-sync = { version = "0.8.0", features = ["defmt"] }
 embassy-executor = { version = "0.9.0", features = ["arch-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
@@ -21,7 +21,7 @@ embedded-hal-bus = { version = "0.1", features = ["async"] }
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 
 libm = "0.2.15"
-vl53l5cx-rs = { version = "0.1.0", path = "../../../vl53l5cx-rs/vl53l5cx-rs" }
+vl53l5cx-rs = { version = "0.1.0", path = "../../../vl53l5cx-rs/vl53l5cx-rs", default-features = false, features = ["defmt", "distance-mm", "target-status"]  }
 
 [profile.release]
 opt-level = "s"
