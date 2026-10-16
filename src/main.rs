@@ -3,13 +3,11 @@
 
 use defmt::unwrap;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
 use embassy_stm32::{
     Config, bind_interrupts,
-    flash::Flash,
-    gpio::{Flex, Level, Output, OutputType, Speed},
-    peripherals::{self, DMA1_CH6, DMA1_CH7, USART2},
-    rcc::{Pll, PllMul, PllPreDiv, PllRDiv, PllSource, Sysclk, mux::Adcsel},
+    gpio::OutputType,
+    peripherals::{DMA1_CH6, DMA1_CH7, USART2},
+    rcc::{Pll, PllMul, PllPreDiv, PllRDiv, PllSource, Sysclk},
     time::Hertz,
     timer::{
         low_level::CountingMode,
@@ -17,7 +15,6 @@ use embassy_stm32::{
     },
     usart::Uart,
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::Timer;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -29,7 +26,7 @@ bind_interrupts!(struct Irqs {
 });
 
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
+async fn main(_spawner: Spawner) {
     let mut config = Config::default();
     // setup clock to be 80MHz (using 16MHz HSI and 5x PLL)
     config.rcc.hsi = true;
@@ -63,7 +60,7 @@ async fn main(spawner: Spawner) {
     led_pwm.ch2().enable();
 
     let uart_config = embassy_stm32::usart::Config::default();
-    let uart = unwrap!(Uart::new(
+    let _uart = unwrap!(Uart::new(
         p.USART2,
         p.PA15,
         p.PA2,
@@ -72,7 +69,6 @@ async fn main(spawner: Spawner) {
         Irqs,
         uart_config,
     ));
-
 
     let mut x = 0.0;
     loop {
