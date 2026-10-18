@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
 
-use defmt::{info, unwrap};
+use crate::vl53l5cx::Vl53l5cx;
+use defmt::{error, info, unwrap, warn};
 use embassy_executor::Spawner;
 use embassy_stm32::{
     Config, bind_interrupts,
@@ -9,7 +10,7 @@ use embassy_stm32::{
     gpio::{Level, Output, OutputType, Pull, Speed},
     i2c::{self, I2c},
     interrupt::typelevel::EXTI15_10,
-    peripherals::{DMA1_CH6, DMA1_CH7, USART2},
+    peripherals::{DMA1_CH6, DMA1_CH7, TIM2, USART2},
     rcc::{Pll, PllMul, PllPreDiv, PllRDiv, PllSource, Sysclk},
     time::{Hertz, khz},
     timer::{
@@ -19,8 +20,7 @@ use embassy_stm32::{
     usart::Uart,
 };
 use embassy_time::{Duration, Timer};
-
-use crate::vl53l5cx::Vl53l5cx;
+use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -35,8 +35,6 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-
-
     let mut config = Config::default();
     // setup clock to be 80MHz (using 16MHz HSI and 5x PLL)
     config.rcc.hsi = true;
@@ -61,7 +59,7 @@ async fn main(spawner: Spawner) {
 
     info!("Hello");
 
-    let mut led_pwm = SimplePwm::new(
+    let led_pwm = SimplePwm::new(
         p.TIM2,
         None,
         Some(PwmPin::new(p.PB3, OutputType::PushPull)),
@@ -71,9 +69,9 @@ async fn main(spawner: Spawner) {
         CountingMode::EdgeAlignedUp,
     );
 
-    led_pwm.ch2().enable();
+    unwrap!(spawner.spawn(led_task(led_pwm)));
 
-    {
+    let mut vl53l5cx = {
         let int = ExtiInput::new(
             p.PA12, // D2
             p.EXTI12,
@@ -96,7 +94,7 @@ async fn main(spawner: Spawner) {
             Speed::Low,
         );
         let mut i2c_conf = i2c::Config::default();
-        i2c_conf.frequency = khz(100);
+        i2c_conf.frequency = khz(400);
         i2c_conf.gpio_speed = Speed::High;
         i2c_conf.sda_pullup = false;
         i2c_conf.scl_pullup = false;
@@ -107,13 +105,12 @@ async fn main(spawner: Spawner) {
             i2c_conf,
         );
 
-        let vl53l5cx = Vl53l5cx::init(int, i2c_rst, lpn, pwr_en, i2c).await;
+        Vl53l5cx::init(int, i2c_rst, lpn, pwr_en, i2c).await
+    };
 
-        unwrap!(spawner.spawn(test(vl53l5cx)));
-    }
-
-    let uart_config = embassy_stm32::usart::Config::default();
-    let _uart = unwrap!(Uart::new(
+    let mut uart_config = embassy_stm32::usart::Config::default();
+    uart_config.baudrate = 921_600;
+    let mut uart = unwrap!(Uart::new(
         p.USART2,
         p.PA15,
         p.PA2,
@@ -123,18 +120,71 @@ async fn main(spawner: Spawner) {
         uart_config,
     ));
 
-    let mut x = 0.0;
+    #[derive(IntoBytes, Immutable, KnownLayout)]
+    #[repr(C)]
+    struct Payload {
+        zones: [[i16; 4]; 64],
+    }
+    let mut payload = Payload {
+        zones: [[0; 4]; 64],
+    };
+
+    info!("ready");
+
     loop {
-        x += 0.01;
-        let duty_cycle = (libm::sin(x) * 0.5 + 0.5) * led_pwm.ch2().max_duty_cycle() as f64;
-        led_pwm.ch2().set_duty_cycle(duty_cycle as u32);
-        Timer::after_millis(1).await;
+        // wait for uart ready signal
+        let mut buf = [0u8; 1];
+        loop {
+            unwrap!(uart.read(&mut buf).await);
+            if buf[0] == 0x23 {
+                break;
+            } else {
+                warn!("UART unknown signal received: 0x{:x}", buf[0]);
+            }
+        }
+
+        let result = vl53l5cx.next_frame().await;
+
+        for z in 0..64 {
+            for t in 0..4 {
+                let val = if [5, 9].contains(&unwrap!(result.target_status(z, t))) {
+                    unwrap!(result.distance_mm(z, t))
+                } else {
+                    -1
+                };
+                payload.zones[z][t] = val;
+            }
+        }
+
+        if let Err(e) = uart.write(payload.as_bytes()).await {
+            error!("Error writing to uart: {}", e);
+        }
     }
 }
 
 #[embassy_executor::task]
-async fn test(mut vl53l5cx: Vl53l5cx) {
+async fn led_task(mut led_pwm: SimplePwm<'static, TIM2>) {
+    led_pwm.ch2().enable();
+
+    let max = led_pwm.ch2().max_duty_cycle() as f32;
+    let mut brightness = 0.0f32;
+    let mut step = 0.005f32;
+
     loop {
-        vl53l5cx.next_frame().await;
+        brightness += step;
+        if brightness >= 1.0 {
+            brightness = 1.0;
+            step = -step;
+        } else if brightness <= 0.0 {
+            brightness = 0.0;
+            step = -step;
+        }
+
+        // `brightness * brightness` gives smooth sine-like breathing
+        // and matches human eye perception better than linear fading.
+        led_pwm
+            .ch2()
+            .set_duty_cycle((brightness * brightness * max) as u32);
+        Timer::after_millis(4).await;
     }
 }

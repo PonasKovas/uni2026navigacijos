@@ -6,7 +6,7 @@ use embassy_stm32::{
     mode,
 };
 use embassy_time::{Delay, Timer};
-use vl53l5cx_rs::{PowerMode, Ranging, RangingMode, Resolution};
+use vl53l5cx_rs::{PowerMode, Ranging, RangingMode, Resolution, Results};
 
 pub struct Vl53l5cx {
     int: ExtiInput<'static, mode::Async>,
@@ -40,7 +40,7 @@ impl Vl53l5cx {
         };
 
         unwrap!(uld.set_resolution(Resolution::R8x8));
-        unwrap!(uld.set_ranging_frequency_hz(1));
+        unwrap!(uld.set_ranging_frequency_hz(15));
         unwrap!(uld.set_ranging_mode(RangingMode::Continuous));
         unwrap!(uld.set_power_mode(PowerMode::Wakeup));
 
@@ -54,26 +54,11 @@ impl Vl53l5cx {
             uld,
         }
     }
-    pub async fn next_frame(&mut self) {
+    pub async fn next_frame(&mut self) -> Results<'_> {
         self.int.wait_for_falling_edge().await;
 
         let data = unwrap!(self.uld.get_ranging_data());
 
-        let mut sum: i64 = 0;
-        let mut nones = 0;
-        for i in 0..64 {
-            sum += data.distance_mm(i, 0).unwrap_or(5000) as i64;
-            if data.distance_mm(i, 0).is_none() {
-                nones += 1;
-            }
-        }
-
-        info!(
-            "zones: {}\nsilicon_temp_degc: {}\ndist_sum_mm: {}\nnones: {}",
-            data.zones(),
-            data.silicon_temp_degc(),
-            sum,
-            nones
-        );
+        data
     }
 }
