@@ -5,7 +5,7 @@ use embassy_stm32::{
     i2c::{I2c, Master},
     mode,
 };
-use embassy_time::{Delay, Timer};
+use embassy_time::{Delay, Instant, Timer};
 use vl53l5cx_rs::{PowerMode, Ranging, RangingMode, Resolution, Results};
 
 pub struct Vl53l5cx {
@@ -54,11 +54,12 @@ impl Vl53l5cx {
             uld,
         }
     }
-    pub async fn next_frame(&mut self) -> Results<'_> {
+    pub async fn next_frame(&mut self) -> (Results<'_>, Instant) {
         self.int.wait_for_falling_edge().await;
+        let t = Instant::now();
 
         let data = unwrap!(self.uld.get_ranging_data());
 
-        data
+        (data, t)
     }
 }
