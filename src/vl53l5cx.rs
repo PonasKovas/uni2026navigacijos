@@ -24,11 +24,17 @@ impl Vl53l5cx {
         mut pwr_en: Output<'static>,
         i2c: I2c<'static, mode::Blocking, Master>,
     ) -> Self {
+        // Full power cycle, same order as ST's VL53L5CX_Reset_Sensor. An MCU reset/reflash does
+        // not reset the sensor, so it can still be mid-transaction and holding SDA low.
+        lpn.set_low();
         i2c_rst.set_low();
-        lpn.set_high();
-        pwr_en.set_high();
+        pwr_en.set_low();
+        Timer::after_millis(250).await; // rails fully discharged, I2C state gone
 
-        Timer::after_millis(10).await;
+        pwr_en.set_high();
+        Timer::after_millis(20).await;
+        lpn.set_high();
+        Timer::after_millis(100).await; // boot time
 
         let uld = vl53l5cx_rs::Vl53l5cx::new(i2c, Delay);
 

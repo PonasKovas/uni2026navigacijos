@@ -70,7 +70,8 @@ const READ_FRAMES: usize = 16; // frames per I2C burst
 const RING_LEN: usize = 256; // ~1.28 s of samples if the host stalls
 pub const MAX_BATCH: usize = 64;
 
-const WAKE_TIMEOUT: Duration = Duration::from_millis(20); // fallback if INT is dead
+const INT_CHECK_TIMEOUT: Duration = Duration::from_millis(100); // INT fires every 5 ms at 200 Hz
+const WAKE_TIMEOUT: Duration = Duration::from_millis(20); // INT silent for this long = something is wrong
 
 // boot-time gyro bias measurement (device must be still)
 const CAL_SAMPLES: usize = SAMPLE_RATE_HZ as usize; // 1 s
@@ -98,6 +99,7 @@ impl Sample {
 pub enum InitError {
     I2c(i2c::Error),
     WrongDevice(u8),
+    IntDead, // no data-ready edge: INT wire missing or on the wrong pin
 }
 
 impl From<i2c::Error> for InitError {
@@ -267,7 +269,7 @@ pub struct Mpu6050 {
 }
 
 enum Drain {
-    Frames(usize),
+    Drained,
     Overflow,
 }
 
@@ -312,6 +314,11 @@ impl Mpu6050 {
         this.write_reg(REG_INT_ENABLE, INT_ENABLE_DATA_RDY).await?;
         this.write_reg(REG_FIFO_EN, FIFO_EN_ACCEL_GYRO).await?;
         this.reset_fifo().await?; // also starts the FIFO
+
+        // INT must toggle at the sample rate. If it doesn't, fail now instead of limping along.
+        with_timeout(INT_CHECK_TIMEOUT, this.int.wait_for_rising_edge())
+            .await
+            .map_err(|_| InitError::IntDead)?;
 
         let mut bias = [0i16; 3];
         let mut ok = false;
@@ -389,7 +396,8 @@ impl Mpu6050 {
             }
             frames -= n;
         }
-        Ok(Drain::Frames(total))
+
+        Ok(Drain::Drained)
     }
 
     async fn measure_gyro_bias(&mut self) -> Result<Option<[i16; 3]>, i2c::Error> {
@@ -437,8 +445,15 @@ impl Mpu6050 {
 
     pub async fn run(&mut self) -> ! {
         loop {
-            // wake on data-ready; timeout keeps us draining even if INT is miswired
-            let _ = with_timeout(WAKE_TIMEOUT, self.int.wait_for_rising_edge()).await;
+            if with_timeout(WAKE_TIMEOUT, self.int.wait_for_rising_edge())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "MPU6050 INT timeout: no data-ready edge for {} ms",
+                    WAKE_TIMEOUT.as_millis()
+                );
+            }
             // newest FIFO sample is at most one period older than this instant
             let t_us = Instant::now().as_micros();
 
@@ -447,7 +462,7 @@ impl Mpu6050 {
                 .await;
 
             match res {
-                Ok(Drain::Frames(_)) => {}
+                Ok(Drain::Drained) => {}
                 Ok(Drain::Overflow) => {
                     SHARED.lock(|c| {
                         let mut s = c.borrow_mut();
@@ -477,4 +492,16 @@ impl Mpu6050 {
 #[embassy_executor::task]
 pub async fn mpu6050_task(mut mpu: Mpu6050) -> ! {
     mpu.run().await
+}
+
+/// Drop everything buffered so far. Called when the host first connects: samples taken while
+/// nobody was listening are not a loss, so the first packet must not start with a gap.
+pub fn discard_backlog() {
+    SHARED.lock(|c| {
+        let mut s = c.borrow_mut();
+        s.head = 0;
+        s.len = 0;
+        s.pending_gap = false;
+        s.lost = 0;
+    });
 }

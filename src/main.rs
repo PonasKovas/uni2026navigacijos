@@ -4,7 +4,7 @@
 use crate::{
     mpu6050::{
         ACCEL_LSB_PER_G, GYRO_LSB_PER_DPS_X10, MAX_BATCH, Mpu6050, SAMPLE_RATE_HZ, Sample,
-        mpu6050_task, take_batch,
+        discard_backlog, mpu6050_task, take_batch,
     },
     vl53l5cx::Vl53l5cx,
 };
@@ -169,6 +169,7 @@ async fn main(spawner: Spawner) {
             Pull::Up,
             Irqs,
         );
+        // everything starts low: the sensor stays unpowered until init() runs the power-up sequence
         let i2c_rst = Output::new(
             p.PB0, // D3
             Level::Low,
@@ -176,12 +177,12 @@ async fn main(spawner: Spawner) {
         );
         let lpn = Output::new(
             p.PB1, // D6
-            Level::High,
+            Level::Low,
             Speed::Low,
         );
         let pwr_en = Output::new(
             p.PC14, // D7
-            Level::High,
+            Level::Low,
             Speed::Low,
         );
         let mut i2c_conf = i2c::Config::default();
@@ -201,9 +202,9 @@ async fn main(spawner: Spawner) {
 
     let imu = {
         let int = ExtiInput::new(
-            p.PB5, // D13, MPU INT: push-pull, active high
+            p.PB5, // D11, MPU INT: push-pull, active high
             p.EXTI5,
-            Pull::None,
+            Pull::Down, // a missing wire reads low instead of floating
             Irqs,
         );
 
@@ -239,6 +240,8 @@ async fn main(spawner: Spawner) {
     let mut samples = [Sample::ZERO; MAX_BATCH];
     let mut packet = [0u8; MAX_PACKET_LEN];
     let mut vl53_seq: u32 = 0;
+    let mut first_request = true;
+    let (mut prev_lost, mut prev_resets, mut prev_errors) = (0u32, 0u16, 0u16);
 
     info!("ready");
 
@@ -251,6 +254,12 @@ async fn main(spawner: Spawner) {
                 Ok(()) => warn!("UART unknown signal received: 0x{:x}", buf[0]),
                 Err(e) => warn!("UART rx error: {}", e),
             }
+        }
+
+        // samples taken while nobody was listening are not a loss
+        if first_request {
+            discard_backlog();
+            first_request = false;
         }
 
         let (result, vl53_t) = vl53l5cx.next_frame().await;
@@ -274,8 +283,15 @@ async fn main(spawner: Spawner) {
         let mut flags = 0u16;
         if batch.gap_before {
             flags |= FLAG_IMU_GAP_BEFORE;
-            warn!("IMU discontinuity before seq {}", batch.seq0);
+            warn!(
+                "IMU gap before seq {}: dropped +{}, fifo resets +{}, i2c errors +{}",
+                batch.seq0,
+                batch.lost.wrapping_sub(prev_lost),
+                batch.resets.wrapping_sub(prev_resets),
+                batch.errors.wrapping_sub(prev_errors),
+            );
         }
+        (prev_lost, prev_resets, prev_errors) = (batch.lost, batch.resets, batch.errors);
         if batch.clipped {
             flags |= FLAG_IMU_CLIPPED;
         }
