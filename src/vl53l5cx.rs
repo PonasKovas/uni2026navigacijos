@@ -36,6 +36,12 @@ impl Vl53l5cx {
         lpn.set_high();
         Timer::after_millis(100).await; // boot time
 
+        // reset the sensor's I2C interface
+        i2c_rst.set_high();
+        Timer::after_millis(10).await;
+        i2c_rst.set_low();
+        Timer::after_millis(10).await;
+
         let uld = vl53l5cx_rs::Vl53l5cx::new(i2c, Delay);
 
         info!("Initializing Vl53l5cx...");
