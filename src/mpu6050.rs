@@ -72,6 +72,12 @@ const READ_FRAMES: usize = 16; // frames per I2C burst
 const RING_LEN: usize = 256; // ~1.28 s of samples if the host stalls
 pub const MAX_BATCH: usize = 64;
 
+// Frame alignment check. The temp word sits mid-frame, so a misaligned stream puts accel/gyro
+// data there. Real die temp moves < 20 LSB per sample; a slipped frame jumps far more.
+const TEMP_MIN_RAW: i16 = -26020; // -40 °C
+const TEMP_MAX_RAW: i16 = 16480; // 85 °C
+const TEMP_MAX_STEP_RAW: i32 = 200; // ~0.6 °C between consecutive samples
+
 const INT_CHECK_TIMEOUT: Duration = Duration::from_millis(100); // INT fires every 5 ms at 200 Hz
 const WAKE_TIMEOUT: Duration = Duration::from_millis(20); // INT silent for this long = something is wrong
 
@@ -129,6 +135,8 @@ pub struct Batch {
     pub lost: u32,
     /// cumulative FIFO overflow resets
     pub resets: u16,
+    /// cumulative FIFO resets after a frame failed the alignment check
+    pub misaligned: u16,
     /// cumulative I2C errors
     pub errors: u16,
     /// gyro bias measured at boot, raw LSB (zeros if `calib_ok` is false)
@@ -162,6 +170,7 @@ struct Shared {
     newest_t_us: u64,
     lost: u32,
     resets: u16,
+    misaligned: u16,
     errors: u16,
     gyro_bias: [i16; 3],
     calib_ok: bool,
@@ -178,6 +187,7 @@ impl Shared {
             newest_t_us: 0,
             lost: 0,
             resets: 0,
+            misaligned: 0,
             errors: 0,
             gyro_bias: [0; 3],
             calib_ok: false,
@@ -259,6 +269,7 @@ pub fn take_batch(out: &mut [Sample]) -> Batch {
             backlog: s.len > 0,
             lost: s.lost,
             resets: s.resets,
+            misaligned: s.misaligned,
             errors: s.errors,
             gyro_bias: s.gyro_bias,
             calib_ok: s.calib_ok,
@@ -270,11 +281,14 @@ pub fn take_batch(out: &mut [Sample]) -> Batch {
 pub struct Mpu6050 {
     i2c: I2c<'static, Async, Master>,
     int: ExtiInput<'static, Async>,
+    /// temp of the last accepted frame, None right after a FIFO reset
+    last_temp: Option<i16>,
 }
 
 enum Drain {
     Drained,
     Overflow,
+    Misaligned,
 }
 
 fn parse_frame(b: &[u8]) -> Sample {
@@ -291,7 +305,11 @@ impl Mpu6050 {
         i2c: I2c<'static, Async, Master>,
         int: ExtiInput<'static, Async>,
     ) -> Result<Self, InitError> {
-        let mut this = Self { i2c, int };
+        let mut this = Self {
+            i2c,
+            int,
+            last_temp: None,
+        };
 
         Timer::after_millis(100).await; // power-up time before register access
 
@@ -368,19 +386,41 @@ impl Mpu6050 {
 
     /// disable -> reset -> enable (FIFO_RESET only works while FIFO_EN = 0)
     async fn reset_fifo(&mut self) -> Result<(), i2c::Error> {
+        self.last_temp = None;
         self.write_reg(REG_USER_CTRL, 0).await?;
         self.write_reg(REG_USER_CTRL, USER_CTRL_FIFO_RESET).await?;
         self.write_reg(REG_USER_CTRL, USER_CTRL_FIFO_EN).await
     }
 
-    /// Pops every complete frame currently in the FIFO into `sink`.
-    async fn drain(&mut self, mut sink: impl FnMut(Sample)) -> Result<Drain, i2c::Error> {
+    async fn read_fifo_count(&mut self) -> Result<usize, i2c::Error> {
         // FIFO_COUNT must be read high-then-low: one 2-byte burst starting at H.
         let mut cnt = [0u8; 2];
         self.i2c
             .write_read(ADDR, &[REG_FIFO_COUNT_H], &mut cnt)
             .await?;
-        let count = u16::from_be_bytes(cnt) as usize;
+        Ok(u16::from_be_bytes(cnt) as usize)
+    }
+
+    /// True if the frame's temp word looks like a real temperature continuing the last one.
+    fn frame_aligned(&mut self, s: &Sample) -> bool {
+        let ok = (TEMP_MIN_RAW..=TEMP_MAX_RAW).contains(&s.temp)
+            && self
+                .last_temp
+                .is_none_or(|p| (s.temp as i32 - p as i32).abs() <= TEMP_MAX_STEP_RAW);
+        if ok {
+            self.last_temp = Some(s.temp);
+        }
+        ok
+    }
+
+    /// Pops every complete frame currently in the FIFO into `sink`.
+    async fn drain(&mut self, mut sink: impl FnMut(Sample)) -> Result<Drain, i2c::Error> {
+        // Some MPU6050s (clones) occasionally return a wrong count, H and L not latched
+        // together. Reading more bytes than the FIFO holds eats half of the next frame and
+        // misaligns the stream for good, reading fewer is harmless. So take the smaller of two.
+        let a = self.read_fifo_count().await?;
+        let b = self.read_fifo_count().await?;
+        let count = a.min(b);
 
         if count > FIFO_INTACT_MAX {
             // overwritten oldest bytes -> frame alignment unknown, start over
@@ -397,7 +437,12 @@ impl Mpu6050 {
             let chunk = &mut buf[..n * FRAME_BYTES];
             self.i2c.write_read(ADDR, &[REG_FIFO_R_W], chunk).await?;
             for f in chunk.chunks_exact(FRAME_BYTES) {
-                sink(parse_frame(f));
+                let s = parse_frame(f);
+                if !self.frame_aligned(&s) {
+                    self.reset_fifo().await?;
+                    return Ok(Drain::Misaligned);
+                }
+                sink(s);
             }
             frames -= n;
         }
@@ -475,6 +520,14 @@ impl Mpu6050 {
                         s.pending_gap = true;
                     });
                     warn!("MPU6050 FIFO overflow, FIFO reset");
+                }
+                Ok(Drain::Misaligned) => {
+                    SHARED.lock(|c| {
+                        let mut s = c.borrow_mut();
+                        s.misaligned = s.misaligned.wrapping_add(1);
+                        s.pending_gap = true;
+                    });
+                    warn!("MPU6050 FIFO frame misaligned, FIFO reset");
                 }
                 Err(e) => {
                     SHARED.lock(|c| {

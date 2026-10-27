@@ -54,7 +54,7 @@ bind_interrupts!(struct Irqs {
 //   Header (56 B) | zones: 64 x 4 x i16 (512 B) | n_imu x Sample (14 B: ax ay az gx gy gz temp, i16) | crc32 (4 B)
 //
 // crc32 = zlib/IEEE CRC-32 over everything before it (Python: zlib.crc32(pkt[:-4])).
-// Python header format: "<4sIQQIIHHHHHHH3h2H"
+// Python header format: "<4sIQQIIHHHHHHH3hHH"
 //
 // imu_t_us is the estimated MCU time of the LAST imu sample; sample i is at
 // imu_t_us - (n_imu - 1 - i) / imu_rate_hz. The MPU's clock is not the MCU's clock, so the
@@ -87,7 +87,8 @@ struct Header {
     accel_lsb_per_g: u16,
     gyro_lsb_per_dps_x10: u16, // LSB/dps * 10
     gyro_bias: [i16; 3],       // raw LSB, measured at boot (subtract from gyro)
-    reserved: [u16; 2],
+    imu_misaligned: u16, // cumulative MPU FIFO resets after a frame failed the alignment check
+    reserved: u16,
 }
 
 const HEADER_LEN: usize = size_of::<Header>();
@@ -242,7 +243,7 @@ async fn main(spawner: Spawner) {
     let mut packet = [0u8; MAX_PACKET_LEN];
     let mut vl53_seq: u32 = 0;
     let mut first_request = true;
-    let (mut prev_lost, mut prev_resets, mut prev_errors) = (0u32, 0u16, 0u16);
+    let (mut prev_lost, mut prev_resets, mut prev_misaligned, mut prev_errors) = (0u32, 0u16, 0u16, 0u16);
 
     info!("ready");
 
@@ -285,14 +286,16 @@ async fn main(spawner: Spawner) {
         if batch.gap_before {
             flags |= FLAG_IMU_GAP_BEFORE;
             warn!(
-                "IMU gap before seq {}: dropped +{}, fifo resets +{}, i2c errors +{}",
+                "IMU gap before seq {}: dropped +{}, fifo resets +{}, misaligned +{}, i2c errors +{}",
                 batch.seq0,
                 batch.lost.wrapping_sub(prev_lost),
                 batch.resets.wrapping_sub(prev_resets),
+                batch.misaligned.wrapping_sub(prev_misaligned),
                 batch.errors.wrapping_sub(prev_errors),
             );
         }
-        (prev_lost, prev_resets, prev_errors) = (batch.lost, batch.resets, batch.errors);
+        (prev_lost, prev_resets, prev_misaligned, prev_errors) =
+            (batch.lost, batch.resets, batch.misaligned, batch.errors);
         if batch.clipped {
             flags |= FLAG_IMU_CLIPPED;
         }
@@ -318,7 +321,8 @@ async fn main(spawner: Spawner) {
             accel_lsb_per_g: ACCEL_LSB_PER_G,
             gyro_lsb_per_dps_x10: GYRO_LSB_PER_DPS_X10,
             gyro_bias: batch.gyro_bias,
-            reserved: [0; 2],
+            imu_misaligned: batch.misaligned,
+            reserved: 0,
         };
 
         let mut off = 0;
