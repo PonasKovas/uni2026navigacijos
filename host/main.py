@@ -1,26 +1,15 @@
-import struct
 import sys
 import threading
 import time
-import zlib
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - registers 3D projection
 import numpy as np
 import serial
 
-PORT = "/dev/ttyACM0"
-BAUDRATE = 921600
-REQ_BYTE = b"\x23"  # 0x23 ('#')
-MAX_CAP = 5000.0
+import navlink
 
-# --- Wire Format Definitions ---
-MAGIC = b"NAV2"
-HEADER_FMT = "<4sIQQIIHHHHHHH3h2H"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 56 bytes
-ZONES_SIZE = 64 * 4 * 2                    # 512 bytes (64 zones * 4 targets * 2 B)
-SAMPLE_SIZE = 14                           # 7 * i16 (ax, ay, az, gx, gy, gz, temp)
-CRC_SIZE = 4
+MAX_CAP = 5000.0
 
 # --- Shared State ---
 data_lock = threading.Lock()
@@ -33,135 +22,21 @@ latest_temp = None                    # MPU die temperature in °C
 
 
 def serial_worker():
-    """Background thread: handles UART request-response loop with framing sync & CRC32."""
-    global latest_zones, latest_accel, latest_gyro_rates, latest_temp, running
-
-    buf = bytearray()
+    """Background thread: keeps the latest packet values for the plot."""
+    global latest_zones, latest_accel, latest_gyro_rates, latest_temp
 
     try:
-        with serial.Serial(PORT, BAUDRATE, timeout=0.1) as ser:
-            ser.reset_input_buffer()
-            ser.write(REQ_BYTE)
-            ser.flush()
-
-            last_req_time = time.monotonic()
-
-            while running:
-                waiting = ser.in_waiting
-                chunk = ser.read(waiting if waiting > 0 else 1)
-                if chunk:
-                    buf.extend(chunk)
-
-                # Search for packet magic sync b"NAV1"
-                idx = buf.find(MAGIC)
-                if idx < 0:
-                    if len(buf) > 3:
-                        del buf[:-3]
-                    # If timeout waiting for MCU response, re-send request
-                    if time.monotonic() - last_req_time > 0.5:
-                        ser.write(REQ_BYTE)
-                        ser.flush()
-                        last_req_time = time.monotonic()
-                    continue
-
-                if idx > 0:
-                    del buf[:idx]
-
-                # Wait for at least the full header
-                if len(buf) < HEADER_SIZE:
-                    continue
-
-                # Parse header to determine variable IMU sample count
-                header_bytes = bytes(buf[:HEADER_SIZE])
-                (
-                    magic,
-                    vl53_seq,
-                    vl53_t_us,
-                    imu_t_us,
-                    imu_seq0,
-                    imu_lost,
-                    n_imu,
-                    flags,
-                    imu_rate_hz,
-                    imu_resets,
-                    imu_errors,
-                    accel_lsb_per_g,
-                    gyro_lsb_per_dps_x10,
-                    bias_x,
-                    bias_y,
-                    bias_z,
-                    res0,
-                    res1,
-                ) = struct.unpack(HEADER_FMT, header_bytes)
-
-                # Sanity check n_imu (firmware MAX_BATCH is 64)
-                if n_imu > 128:
-                    del buf[:4]
-                    continue
-
-                total_packet_len = HEADER_SIZE + ZONES_SIZE + n_imu * SAMPLE_SIZE + CRC_SIZE
-
-                if len(buf) < total_packet_len:
-                    if time.monotonic() - last_req_time > 1.0:
-                        del buf[:4]
-                        ser.write(REQ_BYTE)
-                        ser.flush()
-                        last_req_time = time.monotonic()
-                    continue
-
-                packet = bytes(buf[:total_packet_len])
-                del buf[:total_packet_len]
-
-                # Validate CRC-32 (IEEE / zlib)
-                body = packet[:-CRC_SIZE]
-                pkt_crc = struct.unpack("<I", packet[-CRC_SIZE:])[0]
-                calc_crc = zlib.crc32(body) & 0xFFFFFFFF
-
-                if calc_crc != pkt_crc:
-                    print(f"[CRC Error] expected 0x{pkt_crc:08x}, got 0x{calc_crc:08x}", file=sys.stderr)
-                    ser.write(REQ_BYTE)
-                    ser.flush()
-                    last_req_time = time.monotonic()
-                    continue
-
-                # Parse ToF zones
-                raw_zones = packet[HEADER_SIZE : HEADER_SIZE + ZONES_SIZE]
-                zones = np.frombuffer(raw_zones, dtype="<i2").reshape((64, 4))
-
-                # Parse IMU samples
-                raw_imu = packet[HEADER_SIZE + ZONES_SIZE : HEADER_SIZE + ZONES_SIZE + n_imu * SAMPLE_SIZE]
-                if n_imu > 0:
-                    imu_samples = np.frombuffer(raw_imu, dtype="<i2").reshape((n_imu, 7))
-                else:
-                    imu_samples = np.zeros((0, 7), dtype=np.int16)
-
-                # Scale factors from header
-                acc_scale = float(accel_lsb_per_g) if accel_lsb_per_g > 0 else 16384.0
-                gyro_scale = (float(gyro_lsb_per_dps_x10) / 10.0) if gyro_lsb_per_dps_x10 > 0 else 65.5
-
+        with navlink.open_port() as ser:
+            for pkt in navlink.read_packets(ser):
+                if not running:
+                    break
                 with data_lock:
-                    latest_zones = zones
-
-                    if n_imu > 0:
-                        last_s = imu_samples[-1]
-                        latest_accel = (
-                            float(last_s[0]) / acc_scale,
-                            float(last_s[1]) / acc_scale,
-                            float(last_s[2]) / acc_scale,
-                        )
-
-                        cur_gx = (float(last_s[3]) - bias_x) / gyro_scale
-                        cur_gy = (float(last_s[4]) - bias_y) / gyro_scale
-                        cur_gz = (float(last_s[5]) - bias_z) / gyro_scale
-                        latest_gyro_rates = (cur_gx, cur_gy, cur_gz)
-
+                    latest_zones = pkt.zones
+                    if pkt.n_imu > 0:
+                        latest_accel = tuple(float(v) for v in pkt.accel_g[-1])
+                        latest_gyro_rates = tuple(float(v) for v in pkt.gyro_dps[-1])
                         # average the batch: one sample's temp is only ~0.003 °C/LSB but noisy
-                        latest_temp = float(imu_samples[:, 6].astype(np.float64).mean()) / 340.0 + 36.53
-
-                # Request next packet
-                ser.write(REQ_BYTE)
-                ser.flush()
-                last_req_time = time.monotonic()
+                        latest_temp = float(pkt.temp_c.mean())
 
     except serial.SerialException as e:
         print(f"\n[Serial Error] {e}", file=sys.stderr)

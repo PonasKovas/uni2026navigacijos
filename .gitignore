@@ -1,2 +1,3 @@
 /target
 /.nix-shell-gc-root
+__pycache__/
