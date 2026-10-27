@@ -51,7 +51,7 @@ bind_interrupts!(struct Irqs {
 //
 // One packet per request byte (0x23). All little-endian.
 //
-//   Header (56 B) | zones: 64 x 4 x i16 (512 B) | n_imu x Sample (12 B: ax ay az gx gy gz, i16) | crc32 (4 B)
+//   Header (56 B) | zones: 64 x 4 x i16 (512 B) | n_imu x Sample (14 B: ax ay az gx gy gz temp, i16) | crc32 (4 B)
 //
 // crc32 = zlib/IEEE CRC-32 over everything before it (Python: zlib.crc32(pkt[:-4])).
 // Python header format: "<4sIQQIIHHHHHHH3h2H"
@@ -61,6 +61,7 @@ bind_interrupts!(struct Irqs {
 // host should fit the true rate over a long window from (imu_seq0 + n_imu, imu_t_us) pairs.
 // vl53_t_us is the MCU time of the VL53 data-ready edge (imu_t_us is normally <= one IMU
 // period before it).
+// temp is the MPU die temperature: °C = temp / 340 + 36.53.
 
 const REQ_BYTE: u8 = 0x23;
 
@@ -72,7 +73,7 @@ const FLAG_IMU_BIAS_VALID: u16 = 1 << 3; // gyro_bias was measured while still
 #[derive(IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 struct Header {
-    magic: [u8; 4], // b"NAV1"
+    magic: [u8; 4], // b"NAV2" (NAV1 had 12 B samples without temp)
     vl53_seq: u32,
     vl53_t_us: u64,
     imu_t_us: u64,
@@ -303,7 +304,7 @@ async fn main(spawner: Spawner) {
         }
 
         let header = Header {
-            magic: *b"NAV1",
+            magic: *b"NAV2",
             vl53_seq,
             vl53_t_us: vl53_t.as_micros(),
             imu_t_us: batch.t_us,

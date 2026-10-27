@@ -15,11 +15,11 @@ REQ_BYTE = b"\x23"  # 0x23 ('#')
 MAX_CAP = 5000.0
 
 # --- Wire Format Definitions ---
-MAGIC = b"NAV1"
+MAGIC = b"NAV2"
 HEADER_FMT = "<4sIQQIIHHHHHHH3h2H"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 56 bytes
 ZONES_SIZE = 64 * 4 * 2                    # 512 bytes (64 zones * 4 targets * 2 B)
-SAMPLE_SIZE = 12                           # 6 * i16 (ax, ay, az, gx, gy, gz)
+SAMPLE_SIZE = 14                           # 7 * i16 (ax, ay, az, gx, gy, gz, temp)
 CRC_SIZE = 4
 
 # --- Shared State ---
@@ -29,11 +29,12 @@ running = True
 latest_zones = None
 latest_accel = (0.0, 0.0, 1.0)        # (ax, ay, az) in g
 latest_gyro_rates = (0.0, 0.0, 0.0)   # (gx, gy, gz) in deg/s
+latest_temp = None                    # MPU die temperature in °C
 
 
 def serial_worker():
     """Background thread: handles UART request-response loop with framing sync & CRC32."""
-    global latest_zones, latest_accel, latest_gyro_rates, running
+    global latest_zones, latest_accel, latest_gyro_rates, latest_temp, running
 
     buf = bytearray()
 
@@ -130,9 +131,9 @@ def serial_worker():
                 # Parse IMU samples
                 raw_imu = packet[HEADER_SIZE + ZONES_SIZE : HEADER_SIZE + ZONES_SIZE + n_imu * SAMPLE_SIZE]
                 if n_imu > 0:
-                    imu_samples = np.frombuffer(raw_imu, dtype="<i2").reshape((n_imu, 6))
+                    imu_samples = np.frombuffer(raw_imu, dtype="<i2").reshape((n_imu, 7))
                 else:
-                    imu_samples = np.zeros((0, 6), dtype=np.int16)
+                    imu_samples = np.zeros((0, 7), dtype=np.int16)
 
                 # Scale factors from header
                 acc_scale = float(accel_lsb_per_g) if accel_lsb_per_g > 0 else 16384.0
@@ -153,6 +154,9 @@ def serial_worker():
                         cur_gy = (float(last_s[4]) - bias_y) / gyro_scale
                         cur_gz = (float(last_s[5]) - bias_z) / gyro_scale
                         latest_gyro_rates = (cur_gx, cur_gy, cur_gz)
+
+                        # average the batch: one sample's temp is only ~0.003 °C/LSB but noisy
+                        latest_temp = float(imu_samples[:, 6].astype(np.float64).mean()) / 340.0 + 36.53
 
                 # Request next packet
                 ser.write(REQ_BYTE)
@@ -247,9 +251,11 @@ def main():
             zones = latest_zones.copy()
             acc = latest_accel
             rates = latest_gyro_rates
+            temp = latest_temp
 
+        temp_str = f"{temp:.2f} °C" if temp is not None else "-- °C"
         fig.suptitle(
-            "VL53L5CX ToF & MPU-6050 IMU | Low = Bright | Negative = Gray | Press 'q' to quit",
+            f"VL53L5CX ToF & MPU-6050 IMU ({temp_str}) | Low = Bright | Negative = Gray | Press 'q' to quit",
             fontsize=12,
             fontweight="bold",
         )

@@ -1,8 +1,9 @@
 //! MPU-6050 driver: hardware FIFO @ 200 Hz -> drained by a task -> ring buffer -> `take_batch()`.
 //!
 //! The FIFO is what makes this reliable: vl53l5cx's blocking I2C readout stalls the executor
-//! for tens of ms, but the MPU keeps buffering (85 frames = ~425 ms at 200 Hz).
+//! for tens of ms, but the MPU keeps buffering (73 frames = ~365 ms at 200 Hz).
 //! Raw sensor axes, raw LSB values. Scale factors are exported for the packet header.
+//! Temperature: °C = raw / 340 + 36.53 (die temperature, not ambient).
 
 use core::cell::RefCell;
 
@@ -40,7 +41,7 @@ const PWR1_CLKSEL_PLL_XGYRO: u8 = 1;
 const SIGNAL_PATH_RESET_ALL: u8 = 0b111;
 const USER_CTRL_FIFO_EN: u8 = 1 << 6;
 const USER_CTRL_FIFO_RESET: u8 = 1 << 2;
-const FIFO_EN_ACCEL_GYRO: u8 = (1 << 6) | (1 << 5) | (1 << 4) | (1 << 3); // XG YG ZG ACCEL
+const FIFO_EN_TEMP_ACCEL_GYRO: u8 = (1 << 7) | (1 << 6) | (1 << 5) | (1 << 4) | (1 << 3); // TEMP XG YG ZG ACCEL
 const INT_ENABLE_DATA_RDY: u8 = 1;
 
 // ---------------------------------------------------------------- configuration
@@ -62,9 +63,10 @@ pub const GYRO_LSB_PER_DPS_X10: u16 = match GYRO_FS_SEL {
     _ => 164,
 };
 
-const FRAME_BYTES: usize = 12; // ax ay az gx gy gz, big-endian i16 each
+// FIFO is filled in register order: ax ay az temp gx gy gz, big-endian i16 each
+const FRAME_BYTES: usize = 14;
 const FIFO_SIZE: usize = 1024;
-const FIFO_INTACT_MAX: usize = FIFO_SIZE / FRAME_BYTES * FRAME_BYTES; // 1020; above this we can't trust alignment
+const FIFO_INTACT_MAX: usize = FIFO_SIZE / FRAME_BYTES * FRAME_BYTES; // 1022; above this we can't trust alignment
 const READ_FRAMES: usize = 16; // frames per I2C burst
 
 const RING_LEN: usize = 256; // ~1.28 s of samples if the host stalls
@@ -86,12 +88,14 @@ const CAL_MAX_RANGE_DPS_X10: i32 = 15; // peak-to-peak 1.5 dps allowed while "st
 pub struct Sample {
     pub accel: [i16; 3],
     pub gyro: [i16; 3],
+    pub temp: i16,
 }
 
 impl Sample {
     pub const ZERO: Sample = Sample {
         accel: [0; 3],
         gyro: [0; 3],
+        temp: 0,
     };
 }
 
@@ -277,7 +281,8 @@ fn parse_frame(b: &[u8]) -> Sample {
     let v = |i: usize| i16::from_be_bytes([b[2 * i], b[2 * i + 1]]);
     Sample {
         accel: [v(0), v(1), v(2)],
-        gyro: [v(3), v(4), v(5)],
+        gyro: [v(4), v(5), v(6)],
+        temp: v(3),
     }
 }
 
@@ -312,7 +317,7 @@ impl Mpu6050 {
         this.write_reg(REG_ACCEL_CONFIG, ACCEL_AFS_SEL << 3).await?;
         this.write_reg(REG_INT_PIN_CFG, 0).await?; // active high, push-pull, 50 µs pulse
         this.write_reg(REG_INT_ENABLE, INT_ENABLE_DATA_RDY).await?;
-        this.write_reg(REG_FIFO_EN, FIFO_EN_ACCEL_GYRO).await?;
+        this.write_reg(REG_FIFO_EN, FIFO_EN_TEMP_ACCEL_GYRO).await?;
         this.reset_fifo().await?; // also starts the FIFO
 
         // INT must toggle at the sample rate. If it doesn't, fail now instead of limping along.
