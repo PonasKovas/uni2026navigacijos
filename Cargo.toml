@@ -30,7 +30,7 @@ cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 
-vl53l5cx-rs = { version = "0.1.0", path = "../../../vl53l5cx-rs/vl53l5cx-rs", default-features = false, features = [
+vl53l5cx-rs = { git = "https://github.com/PonasKovas/vl53l5cx-rs", default-features = false, features = [
     "defmt",
     "distance-mm",
     "target-status",
