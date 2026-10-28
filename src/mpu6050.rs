@@ -432,37 +432,51 @@ impl Mpu6050 {
         let total = count / FRAME_BYTES;
         let mut frames = total;
         let mut buf = [0u8; READ_FRAMES * FRAME_BYTES];
-        // last accepted frame, kept across bursts for the misalignment dump
+        // last frame of the previous burst, for the misalignment dump
         let mut prev = [0u8; FRAME_BYTES];
         while frames > 0 {
             let n = frames.min(READ_FRAMES);
             let chunk = &mut buf[..n * FRAME_BYTES];
             self.i2c.write_read(ADDR, &[REG_FIFO_R_W], chunk).await?;
+
+            // Check the whole burst before using any of it. A glitched read turns into constant
+            // bytes (0xfe/0xff) from some byte on, and the temp word (bytes 6-7) only catches
+            // that one frame late, so the frame before a failing one is suspect too. Garbage
+            // never spans two I2C transfers, so earlier bursts are fine.
+            let mut bad = None;
             for (i, f) in chunk.chunks_exact(FRAME_BYTES).enumerate() {
-                let s = parse_frame(f);
                 let last_temp = self.last_temp;
-                if !self.frame_aligned(&s) {
-                    // Raw dump to tell a real byte slip (good frames shifted by 1-2 bytes)
-                    // from a single corrupt temp word. Burst size hints at a read/write race.
-                    warn!(
-                        "MPU6050 FIFO frame misaligned, FIFO reset: frame {}/{} of burst, frame {}/{} of drain, count {}/{}, temp {} last {}\n  prev  {=[u8]:02x}\n  burst {=[u8]:02x}",
-                        i,
-                        n,
-                        total - frames + i,
-                        total,
-                        a,
-                        b,
-                        s.temp,
-                        last_temp,
-                        prev,
-                        chunk,
-                    );
-                    self.reset_fifo().await?;
-                    return Ok(Drain::Misaligned);
+                if !self.frame_aligned(&parse_frame(f)) {
+                    bad = Some((i, last_temp));
+                    break;
                 }
-                prev.copy_from_slice(f);
-                sink(s);
             }
+            let good = bad.map_or(n, |(i, _)| i.saturating_sub(1));
+            for f in chunk.chunks_exact(FRAME_BYTES).take(good) {
+                sink(parse_frame(f));
+            }
+
+            if let Some((i, last_temp)) = bad {
+                // Raw dump to tell a real byte slip (good frames shifted by 1-2 bytes) from a
+                // read that went bad mid-transfer (constant bytes) or a single corrupt temp word.
+                warn!(
+                    "MPU6050 FIFO frame misaligned, FIFO reset: frame {}/{} of burst ({} dropped), frame {}/{} of drain, count {}/{}, temp {} last {}\n  prev  {=[u8]:02x}\n  burst {=[u8]:02x}",
+                    i,
+                    n,
+                    n - good,
+                    total - frames + i,
+                    total,
+                    a,
+                    b,
+                    parse_frame(&chunk[i * FRAME_BYTES..]).temp,
+                    last_temp,
+                    prev,
+                    chunk,
+                );
+                self.reset_fifo().await?;
+                return Ok(Drain::Misaligned);
+            }
+            prev.copy_from_slice(&chunk[(n - 1) * FRAME_BYTES..]);
             frames -= n;
         }
 

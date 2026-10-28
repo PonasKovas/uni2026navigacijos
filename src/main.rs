@@ -210,9 +210,11 @@ async fn main(spawner: Spawner) {
             Irqs,
         );
 
+        // 100 kHz and slow edges: at 400 kHz with fast edges reads sometimes went bad
+        // mid-transfer (constant 0xfe/0xff). IMU traffic is ~50 kbit/s, so 100 kHz is enough.
         let mut i2c_conf = i2c::Config::default();
-        i2c_conf.frequency = khz(400);
-        i2c_conf.gpio_speed = Speed::High;
+        i2c_conf.frequency = khz(100);
+        i2c_conf.gpio_speed = Speed::Low;
         i2c_conf.sda_pullup = false;
         i2c_conf.scl_pullup = false;
         i2c_conf.timeout = Duration::from_millis(50);
