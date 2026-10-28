@@ -14,6 +14,8 @@ host_t (s since record start) and mcu_t_us are per packet, so ~13 samples share 
 
 import argparse
 import datetime
+import json
+import pathlib
 import queue
 import sys
 import threading
@@ -106,8 +108,16 @@ def cmd_record(args):
 
 # ============================================================ loading
 
+def find_calib(log_path):
+    """Newest *.calib.json next to the log (written by calib6), or None."""
+    found = sorted(pathlib.Path(log_path).resolve().parent.glob("*.calib.json"),
+                   key=lambda f: f.stat().st_mtime)
+    return str(found[-1]) if found else None
+
+
 class Log:
-    def __init__(self, path, rate_source="host", until=None):
+    def __init__(self, path, rate_source="host", until=None, calib="auto"):
+        """calib: "auto" = newest *.calib.json next to the log, a path, or None for raw accel."""
         self.meta = {}
         self.marks = []  # (n, host_t, label)
         with open(path) as f:
@@ -133,6 +143,13 @@ class Log:
         gyro_scale = float(self.meta.get("gyro_lsb_per_dps", 65.5))
         self.acc = d[:, 4:7] / acc_scale              # g
         self.gyro = d[:, 7:10] / gyro_scale           # °/s, raw (no bias removed)
+
+        # accel calibration from calib6: a_true = inverse @ (a_meas - offset)
+        self.calib = find_calib(path) if calib == "auto" else calib
+        if self.calib:
+            with open(self.calib) as f:
+                c = json.load(f)
+            self.acc = (self.acc - np.array(c["offset"])) @ np.array(c["inverse"]).T
         self.temp = navlink.temp_to_c(d[:, 10])       # °C
         self.boot_bias = np.array([float(b) for b in self.meta["boot_gyro_bias"].split(",")]) / gyro_scale
 
@@ -198,6 +215,7 @@ class Log:
 
     def summary(self):
         print(f"{len(self.seq)} samples, {self.t[-1]:.1f} s, temp {self.temp.min():.2f}..{self.temp.max():.2f} °C")
+        print(f"accel calibration: {self.calib}" if self.calib else "accel calibration: none (raw accel)")
         print("rate [Hz]: " + "  ".join(f"{k} {v:.4f}" for k, v in self.rates.items())
               + f"  -> using {self.rate:.4f}")
         if self.gaps:
@@ -329,7 +347,7 @@ def estimate_bias(log, seconds):
 # ============================================================ analyze
 
 def cmd_analyze(args):
-    log = Log(args.log, args.rate, args.until)
+    log = Log(args.log, args.rate, args.until, args.calib)
     log.summary()
     bias_s = args.bias_seconds if args.bias_seconds > 0 else 5.0
     bias = log.boot_bias if args.bias_seconds == 0 else estimate_bias(log, args.bias_seconds)
@@ -346,6 +364,8 @@ def cmd_analyze(args):
     q = integrate_quat(np.radians(omega), 1.0 / log.rate, q0)
     g_yaw, g_pitch, g_roll = quat_to_euler(q)
     a_pitch, a_roll = accel_tilt(acc)
+    # accel roll is wrapped to ±180 and flips sign upside down; put it on the gyro's (unwrapped) turn
+    a_roll = a_roll + 360 * np.round((g_roll - a_roll) / 360)
     segs = find_still(omega, log.rate, args.still_thresh, args.min_still, args.trim)
     mark_t = [(n, log.host_to_t(ht), label) for n, ht, label in log.marks]
 
@@ -433,8 +453,27 @@ def cmd_analyze(args):
         ax.legend(loc="upper left", fontsize=8)
     fig.suptitle(f"{args.log}  (gray = still segments, dashed = marks)")
     fig.tight_layout()
+
+    # Slide figure: the same tilt seen by both sensors. Accel is exact when still but swings
+    # during motion (it also feels linear acceleration); gyro is smooth but drifts.
+    with plt.rc_context({"font.size": 13, "axes.spines.top": False, "axes.spines.right": False}):
+        fig2, axs2 = plt.subplots(2, 1, sharex=True, figsize=(13, 7))
+        for ax, name, gy, ac in ((axs2[0], "pitch", g_pitch, a_pitch), (axs2[1], "roll", g_roll, a_roll)):
+            for s, e in segs:
+                ax.axvspan(log.t[s], log.t[e - 1], color="#e4e3df", lw=0, zorder=0)
+            ax.plot(log.t, ac, color="#eb6834", lw=0.8, label="from accelerometer")
+            ax.plot(log.t, gy, color="#2a78d6", lw=2, label="from gyro (integrated)")
+            ax.set_ylabel(f"{name} [°]")
+            ax.grid(True, axis="y", ls=":", alpha=0.6)
+        axs2[0].legend(loc="upper left", ncols=2, frameon=False)
+        axs2[1].set_xlabel("time [s]")
+        axs2[0].set_title("pitch and roll: gyro vs accelerometer (shaded = still)"
+                          + ("" if log.calib else ", accel NOT calibrated"))
+        fig2.tight_layout()
+
     if args.save:
         fig.savefig(args.save, dpi=150)
+        fig2.savefig(args.save.rsplit(".", 1)[0] + ".tilt.png", dpi=200)
     plt.show()
 
 
@@ -454,7 +493,7 @@ def allan_deviation(omega, rate, points=60):
 
 
 def cmd_stationary(args):
-    log = Log(args.log, args.rate, args.until)
+    log = Log(args.log, args.rate, args.until, args.calib)
     log.summary()
     keep = log.t >= args.skip
     t, gyro, temp = log.t[keep], log.gyro[keep], log.temp[keep]
@@ -592,9 +631,7 @@ def cmd_calib6(args):
     degrees are fine. The box method is printed for comparison; it also catches axis
     misalignment, but only if every face sat square on a flat table.
     """
-    import json
-
-    log = Log(args.log, args.rate, args.until)
+    log = Log(args.log, args.rate, args.until, calib=None)  # calibrating: must see raw accel
     log.summary()
     gyro_bias = np.median(log.gyro, axis=0)  # a calibration run is mostly holds
     segs = find_still(log.gyro - gyro_bias, log.rate, args.still_thresh, args.min_still, args.trim)
@@ -753,8 +790,15 @@ def main():
         sp.add_argument("--save", metavar="PNG", help="also save the plot(s)")
         sp.add_argument("--until", type=float, help="only use the log up to this many seconds (host time)")
 
+    def calib_opts(sp):
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--calib", default="auto", metavar="JSON",
+                       help="accel calibration from calib6 (default: newest *.calib.json next to the log)")
+        g.add_argument("--no-calib", dest="calib", action="store_const", const=None, help="use raw accel")
+
     a = sub.add_parser("analyze", help="rotate-and-hold runs: find still segments, compare angles")
     common(a)
+    calib_opts(a)
     a.add_argument("--bias-seconds", type=float, default=5,
                    help="gyro bias from the first N s of the log (0 = use boot bias)")
     a.add_argument("--still-thresh", type=float, default=1.0, help="°/s, below this counts as still")
@@ -764,6 +808,7 @@ def main():
 
     s = sub.add_parser("stationary", help="long still logs: Allan deviation, bias drift vs time and temp")
     common(s)
+    calib_opts(s)
     s.add_argument("--skip", type=float, default=0, help="ignore the first N s (warm-up)")
     s.add_argument("--window", type=float, default=10, help="s, moving mean window for bias vs time")
     s.add_argument("--bias-seconds", type=float, default=10, help="bias window for the angle drift plot")
