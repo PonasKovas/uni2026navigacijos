@@ -587,6 +587,10 @@ def cmd_calib6(args):
     Record with `record`, hold the board still for ~10 s with each sensor axis pointing up and
     then down (+X -X +Y -Y +Z -Z, any order), and rotate between holds. A few extra holds at
     odd angles (e.g. 45° on a book) are not used for the fit and serve as an independent check.
+
+    The sphere fit is the result: it only needs |g| = 1, so hand-held holds tilted by a few
+    degrees are fine. The box method is printed for comparison; it also catches axis
+    misalignment, but only if every face sat square on a flat table.
     """
     import json
 
@@ -654,9 +658,12 @@ def cmd_calib6(args):
     print(f"|a| error RMS [mg]: raw {rms(raw_err):.1f}, box {rms(box_err[~is_check]):.1f} on faces"
           f" / {rms(box_err[is_check]):.1f} on check holds, sphere {rms(sph_err[~is_check]):.1f}"
           f" / {rms(sph_err[is_check]):.1f}")
+    if rms(box_err[~is_check]) > 3 * max(rms(sph_err[~is_check]), 1.0):
+        print("box method fits much worse than the sphere: faces were not square (hand-held?), "
+              "ignore its numbers")
 
-    # Gyro bias vs gravity: gyro = c + G @ g_true. Temperature drift during the run leaks in.
-    g_true = (acc - b) @ Minv.T
+    # Gyro bias vs gravity: gyro = c + G @ g_true. Temperature drift and hand wobble leak in.
+    g_true = (acc - sb) / ss
     X = np.hstack([np.ones((len(holds), 1)), g_true])
     coef = np.linalg.lstsq(X, np.array([h["gyro"] for h in holds]), rcond=None)[0]
     G = coef[1:].T  # G[i, j]: gyro axis i per g along axis j
@@ -670,9 +677,9 @@ def cmd_calib6(args):
     with open(out, "w") as f:
         json.dump({
             "log": args.log,
-            "model": "a_true = inverse @ (a_meas - offset), a in g",
-            "offset": b.tolist(), "matrix": M.tolist(), "inverse": Minv.tolist(),
-            "sphere_offset": sb.tolist(), "sphere_scale": ss.tolist(),
+            "model": "a_true = inverse @ (a_meas - offset), a in g (sphere fit)",
+            "offset": sb.tolist(), "matrix": np.diag(ss).tolist(), "inverse": np.diag(1 / ss).tolist(),
+            "box_offset": b.tolist(), "box_matrix": M.tolist(),
             "gyro_g_sensitivity_dps_per_g": G.tolist(),
             "temp_c": float(temps.mean()),
         }, f, indent=2)
@@ -703,16 +710,16 @@ def cmd_calib6(args):
     fig2, axs = plt.subplots(1, 3, figsize=(16, 5.5), gridspec_kw={"width_ratios": [2.2, 1, 1]})
     x = np.arange(len(holds))
     axs[0].bar(x - 0.2, raw_err, 0.4, color=CALIB_COLORS["raw"], label="raw")
-    axs[0].bar(x + 0.2, box_err, 0.4, color=CALIB_COLORS["cal"], label="calibrated (box)")
+    axs[0].bar(x + 0.2, sph_err, 0.4, color=CALIB_COLORS["cal"], label="calibrated")
     axs[0].axhline(0, color="#52514e", lw=0.8)
     axs[0].set_xticks(x, labels)
     axs[0].set_ylabel("|a| − 1 g  [mg]")
     axs[0].set_title(f"gravity length error per hold\nRMS raw {rms(raw_err):.0f} mg → calibrated "
-                     f"{rms(box_err):.1f} mg")
+                     f"{rms(sph_err):.1f} mg")
     axs[0].legend(frameon=False)
-    axs[1].bar(list("XYZ"), b * 1000, 0.6, color=CALIB_COLORS["axes"])
+    axs[1].bar(list("XYZ"), sb * 1000, 0.6, color=CALIB_COLORS["axes"])
     axs[1].set_title("offset [mg]")
-    axs[2].bar(list("XYZ"), (np.diag(M) - 1) * 100, 0.6, color=CALIB_COLORS["axes"])
+    axs[2].bar(list("XYZ"), (ss - 1) * 100, 0.6, color=CALIB_COLORS["axes"])
     axs[2].set_title("scale error [%]")
     for ax in axs:
         ax.grid(True, axis="y", ls=":", alpha=0.6)
@@ -764,7 +771,8 @@ def main():
 
     c = sub.add_parser("calib6", help="6-position accel calibration (+ gyro g-sensitivity)")
     common(c)
-    c.add_argument("--still-thresh", type=float, default=1.0, help="°/s, below this counts as still")
+    c.add_argument("--still-thresh", type=float, default=5.0,
+                   help="°/s, below this counts as still (hand-held holds wobble 1-3 °/s)")
     c.add_argument("--min-still", type=float, default=3.0, help="s, shortest hold kept")
     c.add_argument("--trim", type=float, default=0.5, help="s cut from both ends of each hold")
     c.set_defaults(func=cmd_calib6)
