@@ -293,9 +293,11 @@ async fn main(spawner: Spawner) {
                 batch.misaligned.wrapping_sub(prev_misaligned),
                 batch.errors.wrapping_sub(prev_errors),
             );
+            // Only snapshot here: a counter bumps before its gap flag reaches a sample, so a
+            // packet in between would otherwise swallow the delta.
+            (prev_lost, prev_resets, prev_misaligned, prev_errors) =
+                (batch.lost, batch.resets, batch.misaligned, batch.errors);
         }
-        (prev_lost, prev_resets, prev_misaligned, prev_errors) =
-            (batch.lost, batch.resets, batch.misaligned, batch.errors);
         if batch.clipped {
             flags |= FLAG_IMU_CLIPPED;
         }

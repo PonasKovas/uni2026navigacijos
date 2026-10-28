@@ -432,16 +432,35 @@ impl Mpu6050 {
         let total = count / FRAME_BYTES;
         let mut frames = total;
         let mut buf = [0u8; READ_FRAMES * FRAME_BYTES];
+        // last accepted frame, kept across bursts for the misalignment dump
+        let mut prev = [0u8; FRAME_BYTES];
         while frames > 0 {
             let n = frames.min(READ_FRAMES);
             let chunk = &mut buf[..n * FRAME_BYTES];
             self.i2c.write_read(ADDR, &[REG_FIFO_R_W], chunk).await?;
-            for f in chunk.chunks_exact(FRAME_BYTES) {
+            for (i, f) in chunk.chunks_exact(FRAME_BYTES).enumerate() {
                 let s = parse_frame(f);
+                let last_temp = self.last_temp;
                 if !self.frame_aligned(&s) {
+                    // Raw dump to tell a real byte slip (good frames shifted by 1-2 bytes)
+                    // from a single corrupt temp word. Burst size hints at a read/write race.
+                    warn!(
+                        "MPU6050 FIFO frame misaligned, FIFO reset: frame {}/{} of burst, frame {}/{} of drain, count {}/{}, temp {} last {}\n  prev  {=[u8]:02x}\n  burst {=[u8]:02x}",
+                        i,
+                        n,
+                        total - frames + i,
+                        total,
+                        a,
+                        b,
+                        s.temp,
+                        last_temp,
+                        prev,
+                        chunk,
+                    );
                     self.reset_fifo().await?;
                     return Ok(Drain::Misaligned);
                 }
+                prev.copy_from_slice(f);
                 sink(s);
             }
             frames -= n;
@@ -527,7 +546,7 @@ impl Mpu6050 {
                         s.misaligned = s.misaligned.wrapping_add(1);
                         s.pending_gap = true;
                     });
-                    warn!("MPU6050 FIFO frame misaligned, FIFO reset");
+                    // details already logged by drain()
                 }
                 Err(e) => {
                     SHARED.lock(|c| {
