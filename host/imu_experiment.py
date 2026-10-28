@@ -4,6 +4,7 @@
     python imu_experiment.py record still.csv -d 1800   # stop by itself after 30 min
     python imu_experiment.py analyze run1.csv           # rotate-and-hold runs: still segments + angles
     python imu_experiment.py stationary still.csv       # long still logs: Allan deviation + drift vs temp
+    python imu_experiment.py calib6 calib.csv           # hold ±X ±Y ±Z up ~10 s each: accel calibration
 
 Log format: comment lines start with '#'. "# key=value" is metadata, "# mark,<n>,<host_t>,<label>"
 is a mark. Every other line is one IMU sample with raw LSB values (gyro NOT bias corrected):
@@ -525,6 +526,206 @@ def cmd_stationary(args):
     plt.show()
 
 
+# ============================================================ calib6
+
+FACE_MIN_ALIGN = 0.97  # hold counts as a face if gravity is within ~14° of a sensor axis
+CALIB_COLORS = {"raw": "#a3a29c", "cal": "#2a78d6", "axes": ["#2a78d6", "#eb6834", "#1baf7a"]}
+
+
+def face_name(g):
+    """Which sensor axis points up, e.g. "+Z", and how well aligned (cosine, 1 = exactly)."""
+    u = g / np.linalg.norm(g)
+    i = int(np.argmax(np.abs(u)))
+    return ("+" if u[i] > 0 else "-") + "XYZ"[i], abs(u[i])
+
+
+def classify_faces(holds, acc):
+    """Set h["face"] to "+X".. for holds square to an axis, None for check holds."""
+    for h, a in zip(holds, acc):
+        name, align = face_name(a)
+        h["face"] = name if align >= FACE_MIN_ALIGN else None
+    faces = {}
+    for h in holds:
+        if h["face"]:
+            faces.setdefault(h["face"], []).append(h["acc"])
+    return {k: np.mean(v, axis=0) for k, v in faces.items()}
+
+
+def fit_box(faces):
+    """Classic 6-position calibration: a_meas = M @ a_true + b, with a_true = ±1 g along each axis.
+
+    faces: {"+X": mean accel, ...}, all six needed. Column i of M is half the difference between
+    axis i up and down; each up/down pair also gives an estimate of b, and b is their mean.
+    Off-diagonal terms of M mix axis misalignment with how square the faces sat on the table.
+    """
+    M = np.column_stack([(faces["+" + n] - faces["-" + n]) / 2 for n in "XYZ"])
+    b = np.mean([(faces["+" + n] + faces["-" + n]) / 2 for n in "XYZ"], axis=0)
+    return M, b
+
+
+def fit_sphere(acc, iters=100):
+    """Per-axis offset b and scale s so that |(a - b) / s| = 1 g for every hold (Gauss-Newton).
+
+    Uses only the length of gravity, so the holds don't need to be square to the table. Needs at
+    least 6 holds spread over all directions.
+    """
+    b, s = np.zeros(3), np.ones(3)
+    for _ in range(iters):
+        u = (acc - b) / s
+        n = np.linalg.norm(u, axis=1)[:, None]
+        J = np.hstack([-u / (n * s), -u ** 2 / (n * s)])  # d|u| / d(b, s)
+        step = np.linalg.lstsq(J, -(n[:, 0] - 1), rcond=None)[0]
+        b, s = b + step[:3], s + step[3:]
+        if np.linalg.norm(step) < 1e-12:
+            break
+    return b, s
+
+
+def cmd_calib6(args):
+    """Accelerometer 6-position calibration and gyro g-sensitivity.
+
+    Record with `record`, hold the board still for ~10 s with each sensor axis pointing up and
+    then down (+X -X +Y -Y +Z -Z, any order), and rotate between holds. A few extra holds at
+    odd angles (e.g. 45° on a book) are not used for the fit and serve as an independent check.
+    """
+    import json
+
+    log = Log(args.log, args.rate, args.until)
+    log.summary()
+    gyro_bias = np.median(log.gyro, axis=0)  # a calibration run is mostly holds
+    segs = find_still(log.gyro - gyro_bias, log.rate, args.still_thresh, args.min_still, args.trim)
+    if not segs:
+        sys.exit("no still holds found")
+
+    holds = []
+    for s, e in segs:
+        a = log.acc[s:e].mean(axis=0)
+        holds.append(dict(t0=log.t[s], t1=log.t[e - 1], acc=a, acc_std=log.acc[s:e].std(axis=0),
+                          gyro=log.gyro[s:e].mean(axis=0), temp=log.temp[s:e].mean()))
+    acc = np.array([h["acc"] for h in holds])
+
+    # A big offset makes raw faces look tilted (0.4 g on Z tilts "+X up" by ~20°), so first take
+    # the best aligned hold per face, fit, and then classify again on calibrated vectors.
+    best = {}
+    for h in holds:
+        name, align = face_name(h["acc"])
+        if align > best.get(name, (0, None))[0]:
+            best[name] = (align, h["acc"])
+    missing = [f"{sg}{n}" for n in "XYZ" for sg in "+-" if f"{sg}{n}" not in best]
+    if missing:
+        sys.exit(f"{len(holds)} holds found, faces missing: {' '.join(missing)} "
+                 f"(hold each axis up and down for ≥ {args.min_still:g} s, or lower --still-thresh)")
+    M, b = fit_box({k: a for k, (_, a) in best.items()})
+    faces = classify_faces(holds, (acc - b) @ np.linalg.inv(M).T)
+    if len(faces) < 6:
+        sys.exit(f"after a first fit only faces {' '.join(sorted(faces))} are square to an axis")
+
+    M, b = fit_box(faces)
+    Minv = np.linalg.inv(M)
+    face_acc = np.array([h["acc"] for h in holds if h["face"]])
+    sb, ss = fit_sphere(face_acc)
+
+    raw_err = (np.linalg.norm(acc, axis=1) - 1) * 1000  # mg
+    box_err = (np.linalg.norm((acc - b) @ Minv.T, axis=1) - 1) * 1000
+    sph_err = (np.linalg.norm((acc - sb) / ss, axis=1) - 1) * 1000
+    is_check = np.array([h["face"] is None for h in holds])
+    temps = np.array([h["temp"] for h in holds])
+
+    print(f"\n{len(holds)} holds ({len(holds) - is_check.sum()} on faces, {is_check.sum()} check)"
+          f", temp {temps.min():.2f}..{temps.max():.2f} °C")
+    print(" hold   t[s]   dur  face  |      acc mean [g]       noise [mg] |  |a|-1 [mg]: raw    box  sphere")
+    for k, h in enumerate(holds):
+        print(f"{k:4d} {h['t0']:7.1f} {h['t1'] - h['t0']:5.1f}  {h['face'] or 'chk':>4}  |"
+              f" {h['acc'][0]:+6.3f} {h['acc'][1]:+6.3f} {h['acc'][2]:+6.3f}   {np.linalg.norm(h['acc_std']) * 1000:5.1f}    |"
+              f"           {raw_err[k]:+7.1f} {box_err[k]:+6.1f} {sph_err[k]:+6.1f}")
+
+    def rms(x):
+        return float(np.sqrt(np.mean(x ** 2))) if len(x) else float("nan")
+
+    print("\naxis | box: offset [mg]  scale err [%] | sphere: offset [mg]  scale err [%]")
+    for i, n in enumerate("XYZ"):
+        print(f"  {n}  |      {b[i] * 1000:+8.1f}     {(M[i, i] - 1) * 100:+7.2f}    |"
+              f"        {sb[i] * 1000:+8.1f}     {(ss[i] - 1) * 100:+7.2f}")
+    # angle between each measured axis and the ideal one: misalignment plus how square the faces sat
+    cols = M / np.linalg.norm(M, axis=0)
+    off = [np.degrees(np.arccos(np.clip(cols[i, i], -1, 1))) for i in range(3)]
+    print("box: axis tilt vs ideal [°]: " + "  ".join(f"{n} {off[i]:.2f}" for i, n in enumerate("XYZ"))
+          + "  (chip misalignment + faces not square to the table)")
+    print(f"|a| error RMS [mg]: raw {rms(raw_err):.1f}, box {rms(box_err[~is_check]):.1f} on faces"
+          f" / {rms(box_err[is_check]):.1f} on check holds, sphere {rms(sph_err[~is_check]):.1f}"
+          f" / {rms(sph_err[is_check]):.1f}")
+
+    # Gyro bias vs gravity: gyro = c + G @ g_true. Temperature drift during the run leaks in.
+    g_true = (acc - b) @ Minv.T
+    X = np.hstack([np.ones((len(holds), 1)), g_true])
+    coef = np.linalg.lstsq(X, np.array([h["gyro"] for h in holds]), rcond=None)[0]
+    G = coef[1:].T  # G[i, j]: gyro axis i per g along axis j
+    print("\ngyro bias vs gravity [°/s per g] (rows: gyro axis, columns: gravity axis)")
+    for i, n in enumerate("XYZ"):
+        print(f"  {n}  " + "  ".join(f"{G[i, j]:+.4f}" for j in range(3)))
+    if np.ptp(temps) > 0.5:
+        print(f"NOTE: temperature moved {np.ptp(temps):.1f} °C between holds, part of this may be temperature")
+
+    out = args.log.rsplit(".", 1)[0] + ".calib.json"
+    with open(out, "w") as f:
+        json.dump({
+            "log": args.log,
+            "model": "a_true = inverse @ (a_meas - offset), a in g",
+            "offset": b.tolist(), "matrix": M.tolist(), "inverse": Minv.tolist(),
+            "sphere_offset": sb.tolist(), "sphere_scale": ss.tolist(),
+            "gyro_g_sensitivity_dps_per_g": G.tolist(),
+            "temp_c": float(temps.mean()),
+        }, f, indent=2)
+    print(f"calibration saved to {out}")
+
+    if args.no_plot:
+        return
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update({"font.size": 13, "axes.spines.top": False, "axes.spines.right": False})
+    labels = [h["face"] or "chk" for h in holds]
+
+    fig1, ax = plt.subplots(figsize=(13, 5))
+    for i, n in enumerate("XYZ"):
+        ax.plot(log.t, log.acc[:, i], color=CALIB_COLORS["axes"][i], lw=1.2, label=f"accel {n}")
+    for h, lab in zip(holds, labels):
+        ax.axvspan(h["t0"], h["t1"], color="#e4e3df", lw=0, zorder=0)
+        ax.annotate(lab, ((h["t0"] + h["t1"]) / 2, 1.0), xycoords=("data", "axes fraction"),
+                    ha="center", va="bottom", fontsize=12, color="#52514e")
+    ax.axhline(0, color="#52514e", lw=0.8)
+    ax.set_xlabel("time [s]")
+    ax.set_ylabel("acceleration [g]")
+    ax.grid(True, axis="y", ls=":", alpha=0.6)
+    ax.legend(loc="lower right", ncols=3, frameon=False)
+    ax.set_title("6-position calibration run (shaded = detected holds)", pad=24)
+    fig1.tight_layout()
+
+    fig2, axs = plt.subplots(1, 3, figsize=(16, 5.5), gridspec_kw={"width_ratios": [2.2, 1, 1]})
+    x = np.arange(len(holds))
+    axs[0].bar(x - 0.2, raw_err, 0.4, color=CALIB_COLORS["raw"], label="raw")
+    axs[0].bar(x + 0.2, box_err, 0.4, color=CALIB_COLORS["cal"], label="calibrated (box)")
+    axs[0].axhline(0, color="#52514e", lw=0.8)
+    axs[0].set_xticks(x, labels)
+    axs[0].set_ylabel("|a| − 1 g  [mg]")
+    axs[0].set_title(f"gravity length error per hold\nRMS raw {rms(raw_err):.0f} mg → calibrated "
+                     f"{rms(box_err):.1f} mg")
+    axs[0].legend(frameon=False)
+    axs[1].bar(list("XYZ"), b * 1000, 0.6, color=CALIB_COLORS["axes"])
+    axs[1].set_title("offset [mg]")
+    axs[2].bar(list("XYZ"), (np.diag(M) - 1) * 100, 0.6, color=CALIB_COLORS["axes"])
+    axs[2].set_title("scale error [%]")
+    for ax in axs:
+        ax.grid(True, axis="y", ls=":", alpha=0.6)
+        ax.axhline(0, color="#52514e", lw=0.8)
+    fig2.tight_layout()
+
+    if args.save:
+        base = args.save.rsplit(".", 1)[0]
+        fig1.savefig(base + ".calib-run.png", dpi=200)
+        fig2.savefig(base + ".calib-result.png", dpi=200)
+    plt.show()
+
+
 # ============================================================ main
 
 def main():
@@ -560,6 +761,13 @@ def main():
     s.add_argument("--window", type=float, default=10, help="s, moving mean window for bias vs time")
     s.add_argument("--bias-seconds", type=float, default=10, help="bias window for the angle drift plot")
     s.set_defaults(func=cmd_stationary)
+
+    c = sub.add_parser("calib6", help="6-position accel calibration (+ gyro g-sensitivity)")
+    common(c)
+    c.add_argument("--still-thresh", type=float, default=1.0, help="°/s, below this counts as still")
+    c.add_argument("--min-still", type=float, default=3.0, help="s, shortest hold kept")
+    c.add_argument("--trim", type=float, default=0.5, help="s cut from both ends of each hold")
+    c.set_defaults(func=cmd_calib6)
 
     args = p.parse_args()
     args.func(args)
