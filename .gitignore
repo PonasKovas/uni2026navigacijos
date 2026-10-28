@@ -1,3 +1,6 @@
 /target
 /.nix-shell-gc-root
 __pycache__/
+
+# recorded IMU logs and analysis outputs
+host/*.csv
