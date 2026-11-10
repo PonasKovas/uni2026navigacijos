@@ -39,6 +39,7 @@ import datetime
 import json
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -283,23 +284,22 @@ def principal_axis(v):
     return a if a[np.argmax(np.abs(a))] > 0 else -a
 
 
-# ============================================================ main
+# ============================================================ shared pipeline (also used by track.py)
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_common_args(p, out_suffix):
     p.add_argument("recording")
-    p.add_argument("-o", "--out", help="output CSV (default: <recording>.pose.csv)")
+    p.add_argument("-o", "--out", help=f"output CSV (default: <recording>{out_suffix})")
     p.add_argument("--calib", default=str(DEFAULT_CALIB), help="accel calibration JSON from imu_experiment.py calib6")
-    p.add_argument("--offset", type=float, nargs=3, default=DEFAULT_OFFSET_M, metavar=("X", "Y", "Z"),
-                   help="ToF position from the pivot in the body frame, metres")
     p.add_argument("--gyro-z-scale", type=float, default=GYRO_Z_SCALE, help="gyro Z reads this many times too much")
     p.add_argument("--tau", type=float, default=1.0, help="s, how slowly accel corrects pitch and roll")
     p.add_argument("--tof-shift-ms", type=float, default=33.0,
                    help="ms before the data-ready edge where a ToF frame's measurement is centred")
     p.add_argument("--no-plot", action="store_true")
     p.add_argument("--save", metavar="PNG", help="also save the check plot")
-    args = p.parse_args()
 
+
+def solve(args):
+    """Load, calibrate and find the orientation. Returns a namespace with per-sample and per-frame data."""
     rec = Recording(args.recording)
     print(f"{len(rec.t)} IMU samples, {rec.t[-1]:.1f} s, rate {rec.rate:.3f} Hz (host clock), "
           f"{rec.rate_mcu:.3f} Hz on the MCU clock, temp {rec.temp.min():.2f}..{rec.temp.max():.2f} °C")
@@ -309,8 +309,8 @@ def main():
     # --- gyro bias
     segs = find_still(rec)
     if not segs:
-        sys.exit("no still moments found, so the gyro bias is unknown. Hold the tripod still for a "
-                 "couple of seconds at the start (and ideally between sweeps).")
+        sys.exit("no still moments found, so the gyro bias is unknown. Hold the sensor still for a "
+                 "couple of seconds at the start (and ideally now and then).")
     bias_track, biases = gyro_bias_track(rec, segs)
     print(f"\n{len(segs)} still moments, gyro bias at each [°/s]:")
     for (s, e), b in zip(segs, biases):
@@ -344,52 +344,84 @@ def main():
     up0 = acc[s0:e0].mean(axis=0) if s0 < rec.rate else acc[: int(STILL_WINDOW_S * rec.rate)].mean(axis=0)
     q = orientation(omega, acc, 1.0 / rec.rate, quat_level(up0), args.tau)
 
-    # --- per ToF frame
-    frames = rec.frames
+    # --- ToF frame times on the sample timeline
     shift = args.tof_shift_ms * 1e-3
-    fidx = rec.mcu_to_index(np.array([fr.vl53_t_us for fr in frames]) * 1e-6 - shift)
+    fidx = rec.mcu_to_index(np.array([fr.vl53_t_us for fr in rec.frames]) * 1e-6 - shift)
     ok = (fidx >= 0) & (fidx <= len(rec.t) - 1)
     if not ok.all():
         print(f"\n{(~ok).sum()} ToF frames outside the IMU data, skipped")
-    i0 = np.floor(fidx[ok]).astype(int)
+    fidx = fidx[ok]
+    i0 = np.floor(fidx).astype(int)
     i1 = np.minimum(i0 + 1, len(rec.t) - 1)
-    qf = qslerp(q[i0], q[i1], fidx[ok] - i0)
+    frac = fidx - i0
 
     # yaw 0 = where the ToF faced at the first frame
-    fwd0 = qrot(qf[0], np.array([1.0, 0.0, 0.0]))
+    fwd0 = qrot(qslerp(q[i0[:1]], q[i1[:1]], frac[:1])[0], np.array([1.0, 0.0, 0.0]))
     yaw_start = np.arctan2(fwd0[1], fwd0[0])
     qyaw = np.array([np.cos(-yaw_start / 2), 0.0, 0.0, np.sin(-yaw_start / 2)])
-    qf = qmul(np.broadcast_to(qyaw, qf.shape), qf)
-    q_all = qmul(np.broadcast_to(qyaw, q.shape), q)
-
-    pos = qrot(qf, np.broadcast_to(np.array(args.offset), (len(qf), 3)))
-    yaw, pitch, roll = quat_to_euler(qf)
-    pitch = -pitch  # ZYX pitch is nose down; flip so looking up is positive
+    q = qmul(np.broadcast_to(qyaw, q.shape), q)
 
     still_mask = np.zeros(len(rec.t), dtype=bool)
     for s, e in segs:
         still_mask[s:e] = True
-    w_gap = int(MAX_TRUSTED_GAP_S * rec.rate)
-    gap_near = moving_mean(rec.filled.astype(float), max(1, w_gap)) > 0
-    seqs = np.array([fr.vl53_seq for fr in frames])[ok]
-    tf = fidx[ok] / rec.rate
+    gap_near = moving_mean(rec.filled.astype(float), max(1, int(MAX_TRUSTED_GAP_S * rec.rate))) > 0
 
-    out = args.out or args.recording.rsplit(".", 1)[0] + ".pose.csv"
-    with open(out, "w") as f:
-        f.write("# nav-pose v1\n")
-        f.write(f"# recording={args.recording}\n")
+    return SimpleNamespace(
+        rec=rec, segs=segs, biases=biases, bias_track=bias_track, acc=acc, omega=omega, q=q,
+        still=still_mask, gap_near=gap_near,
+        frame_no=np.flatnonzero(ok), frame_seq=np.array([fr.vl53_seq for fr in rec.frames])[ok],
+        i0=i0, i1=i1, frac=frac, tf=fidx / rec.rate, qf=qslerp(q[i0], q[i1], frac),
+    )
+
+
+def at_frames(sol, x):
+    """Per-sample array x (n, k) linearly interpolated at the ToF frame times."""
+    f = sol.frac[:, None]
+    return x[sol.i0] * (1 - f) + x[sol.i1] * f
+
+
+def write_frames(path, magic, sol, pos, notes):
+    """One CSV row per ToF frame. pos: (frames, 3) ToF position in metres. notes: extra header lines."""
+    yaw, pitch, roll = quat_to_euler(sol.qf)
+    pitch = -pitch  # ZYX pitch is nose down; flip so looking up is positive
+    with open(path, "w") as f:
+        f.write(f"# {magic}\n")
         f.write(f"# made={datetime.datetime.now().isoformat(timespec='seconds')}\n")
-        f.write("# q rotates body to world. body: +X ToF look direction, +Z grid up. "
-                "world: +Z up, +X initial look direction, origin pivot\n")
-        f.write(f"# offset_m={','.join(str(v) for v in args.offset)}\n")
-        f.write(f"# tof_shift_ms={args.tof_shift_ms}\n")
+        for line in notes:
+            f.write(f"# {line}\n")
         f.write(f"# columns={COLUMNS}\n")
-        for k in range(len(qf)):
-            f.write(f"{np.flatnonzero(ok)[k]},{seqs[k]},{tf[k]:.4f},{int(still_mask[i0[k]])},{int(gap_near[i0[k]])},"
-                    + ",".join(f"{v:.7f}" for v in qf[k]) + ","
+        for k in range(len(sol.qf)):
+            f.write(f"{sol.frame_no[k]},{sol.frame_seq[k]},{sol.tf[k]:.4f},{int(sol.still[sol.i0[k]])},"
+                    f"{int(sol.gap_near[sol.i0[k]])},"
+                    + ",".join(f"{v:.7f}" for v in sol.qf[k]) + ","
                     + ",".join(f"{v:.5f}" for v in pos[k]) + ","
                     + f"{yaw[k]:.3f},{pitch[k]:.3f},{roll[k]:.3f}\n")
-    print(f"\n{len(qf)} frames saved to {out}")
+    print(f"\n{len(sol.qf)} frames saved to {path}")
+    return yaw, pitch, roll
+
+
+# ============================================================ main
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_common_args(p, ".pose.csv")
+    p.add_argument("--offset", type=float, nargs=3, default=DEFAULT_OFFSET_M, metavar=("X", "Y", "Z"),
+                   help="ToF position from the pivot in the body frame, metres")
+    args = p.parse_args()
+
+    sol = solve(args)
+    rec, segs, biases, bias_track, acc, omega = sol.rec, sol.segs, sol.biases, sol.bias_track, sol.acc, sol.omega
+    q_all, qf, tf = sol.q, sol.qf, sol.tf
+
+    pos = qrot(qf, np.broadcast_to(np.array(args.offset), (len(qf), 3)))
+    out = args.out or args.recording.rsplit(".", 1)[0] + ".pose.csv"
+    yaw, pitch, roll = write_frames(out, "nav-pose v1", sol, pos, [
+        f"recording={args.recording}",
+        "q rotates body to world. body: +X ToF look direction, +Z grid up. "
+        "world: +Z up, +X initial look direction, origin pivot",
+        f"offset_m={','.join(str(v) for v in args.offset)}",
+        f"tof_shift_ms={args.tof_shift_ms}",
+    ])
 
     # --- checks
     print(f"\nyaw {yaw.min():+.1f}..{yaw.max():+.1f}°, pitch {pitch.min():+.1f}..{pitch.max():+.1f}°, "

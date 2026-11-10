@@ -1,12 +1,14 @@
-"""Visual check of a pose.py result: replays the rotation in real time.
+"""Visual check of a pose.py or track.py result: replays the motion in real time.
 
     python visualize_pose.py test3.pose.csv            # real time
     python visualize_pose.py test3.pose.csv --speed 2  # twice as fast
+    python visualize_pose.py test10.track.csv          # hand-held, tracked position
 
 Keys: space = pause, left/right = -/+ 5 s, q = quit.
 Left: the sensor in the world (Z up, X = initial look direction). Red = look direction (+X),
-green = +Y, blue = grid up (+Z), gray = trail of the ToF position. Right: yaw/pitch/roll with
-the current time.
+green = +Y, blue = grid up (+Z). Pose files: black arm from the pivot, gray = last 10 s of the
+ToF position. Track files: gray = the whole path so far. Right: yaw/pitch/roll (and position
+for track files) with the current time.
 """
 
 import argparse
@@ -33,6 +35,8 @@ def main():
     p.add_argument("--speed", type=float, default=1.0)
     args = p.parse_args()
 
+    with open(args.pose_csv) as f:
+        track = f.readline().startswith("# nav-track")  # pose.py writes "# nav-pose"
     d = np.genfromtxt(args.pose_csv, delimiter=",", comments="#")
     t = d[:, 2] - d[0, 2]
     q = d[:, 5:9]
@@ -42,24 +46,32 @@ def main():
 
     fig = plt.figure(figsize=(15, 7))
     ax = fig.add_subplot(1, 2, 1, projection="3d")
-    r = max(0.15, 1.6 * np.abs(pos).max())
-    ax.set_xlim(-r, r)
-    ax.set_ylim(-r, r)
-    ax.set_zlim(-r, r)
+    if track:
+        # cube around the whole path
+        c = (pos.min(axis=0) + pos.max(axis=0)) / 2
+        r = max(0.3, 0.6 * np.ptp(pos, axis=0).max())
+    else:
+        c = np.zeros(3)
+        r = max(0.15, 1.6 * np.abs(pos).max())
+    ax.set_xlim(c[0] - r, c[0] + r)
+    ax.set_ylim(c[1] - r, c[1] + r)
+    ax.set_zlim(c[2] - r, c[2] + r)
     ax.set_box_aspect([1, 1, 1])
     ax.set_xlabel("X [m] (initial look)")
     ax.set_ylabel("Y [m] (left)")
     ax.set_zlabel("Z [m] (up)")
-    ax.plot([0], [0], [0], "ko", ms=5)
-    ax.plot([-r, r], [0, 0], [0, 0], color="0.85", lw=0.8)
-    ax.plot([0, 0], [-r, r], [0, 0], color="0.85", lw=0.8)
+    ax.plot([0], [0], [0], "ko", ms=5)  # pivot, or the start for track files
+    if not track:
+        ax.plot([-r, r], [0, 0], [0, 0], color="0.85", lw=0.8)
+        ax.plot([0, 0], [-r, r], [0, 0], color="0.85", lw=0.8)
     (arm,) = ax.plot([], [], [], color="0.3", lw=2)
     (trail,) = ax.plot([], [], [], color="0.6", lw=1)
     axes_lines = [ax.plot([], [], [], color=c, lw=3)[0] for c in ("#e74c3c", "#2ecc71", "#3498db")]
     (ray,) = ax.plot([], [], [], color="#e74c3c", lw=1, ls="--")
     title = ax.set_title("")
 
-    axs = [fig.add_subplot(3, 2, k) for k in (2, 4, 6)]
+    rows = 4 if track else 3
+    axs = [fig.add_subplot(rows, 2, 2 * k + 2) for k in range(rows)]
     cursors = []
     for a, y, name in zip(axs, (yaw, pitch, roll), ("yaw [°]", "pitch [°] (up +)", "roll [°]")):
         a.plot(t, y, lw=1)
@@ -67,6 +79,13 @@ def main():
         a.set_ylabel(name)
         a.grid(True, ls=":", alpha=0.5)
         cursors.append(a.axvline(0, color="k", lw=1))
+    if track:
+        for k, (name, col) in enumerate(zip("XYZ", ("#e74c3c", "#2ecc71", "#3498db"))):
+            axs[3].plot(t, pos[:, k], color=col, lw=1, label=name)
+        axs[3].set_ylabel("position [m]")
+        axs[3].legend(loc="upper right", fontsize=8)
+        axs[3].grid(True, ls=":", alpha=0.5)
+        cursors.append(axs[3].axvline(0, color="k", lw=1))
     axs[-1].set_xlabel("t [s] (green = still)")
 
     state = {"t0": time.monotonic(), "offset": 0.0, "paused": False, "pause_t": 0.0}
@@ -97,9 +116,10 @@ def main():
             state["t0"], state["offset"], cur = time.monotonic(), 0.0, 0.0
         i = int(np.clip(np.searchsorted(t, cur), 0, len(t) - 1))
         p0 = pos[i]
-        arm.set_data([0, p0[0]], [0, p0[1]])
-        arm.set_3d_properties([0, p0[2]])
-        k0 = max(0, i - 15 * 10)  # last ~10 s
+        if not track:
+            arm.set_data([0, p0[0]], [0, p0[1]])
+            arm.set_3d_properties([0, p0[2]])
+        k0 = 0 if track else max(0, i - 15 * 10)  # whole path, or the last ~10 s
         trail.set_data(pos[k0:i + 1, 0], pos[k0:i + 1, 1])
         trail.set_3d_properties(pos[k0:i + 1, 2])
         for line, axis in zip(axes_lines, np.eye(3)):
