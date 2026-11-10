@@ -33,6 +33,7 @@ panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 vl53l5cx-rs = { git = "https://github.com/PonasKovas/vl53l5cx-rs", default-features = false, features = [
     "defmt",
     "distance-mm",
+    "nb-target-detected",
     "target-status",
     "targets-4",
 ] }

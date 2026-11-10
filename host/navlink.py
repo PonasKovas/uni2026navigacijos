@@ -3,6 +3,7 @@
 Wire format is documented in src/main.rs. One packet per request byte.
 """
 
+import json
 import struct
 import sys
 import time
@@ -58,6 +59,7 @@ class Packet:
     imu_misaligned: int  # cumulative FIFO resets after a frame failed the alignment check
     zones: np.ndarray  # (64, 4) i16 distances in mm, -1 = invalid
     imu: np.ndarray    # (n_imu, 7) i16 raw: ax ay az gx gy gz temp
+    raw: bytes         # the whole packet as received, CRC included
 
     @property
     def accel_scale(self):
@@ -107,6 +109,7 @@ def parse_packet(packet: bytes, host_t: float) -> Packet:
         imu_misaligned=h[16],
         zones=zones,
         imu=imu,
+        raw=packet,
     )
 
 
@@ -179,3 +182,36 @@ def read_packets(ser):
 
         last_req_time = _request(ser)
         yield parse_packet(packet, host_t)
+
+
+# --- Recording file (written by record.py) ---
+#
+# b"NAVREC1\n", one UTF-8 JSON line of metadata, then records, all little-endian:
+#   type (1 B: b"P" packet, b"M" mark) | host_t (f64, s since record start) | len (u32) | payload
+# A packet payload is the whole wire packet byte for byte, a mark payload is a UTF-8 label.
+
+REC_MAGIC = b"NAVREC1\n"
+REC_HEADER_FMT = "<cdI"
+REC_HEADER_SIZE = struct.calcsize(REC_HEADER_FMT)  # 13 bytes
+
+
+def load_recording(path):
+    """Returns (meta dict, packets, marks). marks is a list of (host_t, label)."""
+    packets, marks = [], []
+    with open(path, "rb") as f:
+        if f.read(len(REC_MAGIC)) != REC_MAGIC:
+            raise ValueError(f"{path}: not a recording")
+        meta = json.loads(f.readline())
+        while True:
+            head = f.read(REC_HEADER_SIZE)
+            if len(head) < REC_HEADER_SIZE:
+                break  # end of file (or a record cut off by a crash)
+            kind, host_t, n = struct.unpack(REC_HEADER_FMT, head)
+            payload = f.read(n)
+            if len(payload) < n:
+                break
+            if kind == b"P":
+                packets.append(parse_packet(payload, host_t))
+            elif kind == b"M":
+                marks.append((host_t, payload.decode("utf-8", "replace")))
+    return meta, packets, marks

@@ -2,5 +2,8 @@
 /.nix-shell-gc-root
 __pycache__/
 
-# recorded IMU logs and analysis outputs
-host/*.csv
+# recorded data and analysis outputs, anywhere in the tree
+*.csv
+*.navrec
+host/from_pc/
+host/atstumas iki sienos

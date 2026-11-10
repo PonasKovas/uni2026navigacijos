@@ -269,8 +269,12 @@ async fn main(spawner: Spawner) {
         let (result, vl53_t) = vl53l5cx.next_frame().await;
 
         for z in 0..64 {
+            // Only the first nb_target_detected slots of a zone are from this frame. The rest
+            // hold whatever an earlier frame left there, status included.
+            let n_targets = unwrap!(result.nb_target_detected(z)) as usize;
             for t in 0..4 {
-                let val = if [5, 9].contains(&unwrap!(result.target_status(z, t))) {
+                let val = if t < n_targets && [5, 9].contains(&unwrap!(result.target_status(z, t)))
+                {
                     unwrap!(result.distance_mm(z, t))
                 } else {
                     -1
